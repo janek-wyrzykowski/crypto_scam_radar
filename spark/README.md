@@ -68,6 +68,25 @@ when changing input topics or starting-offset behavior; an existing checkpoint
 takes precedence over `--starting-offsets`. Kafka output is at-least-once, so
 downstream consumers should tolerate duplicates when a micro-batch is retried.
 
+## Output Format
+
+The job normalizes incoming streams into a unified data envelope. Validated records are published to `crypto-processed` in the following JSON format:
+
+```json
+{
+  "source_topic": "crypto-market",
+  "event_type": "market_ticker",
+  "processed_at": "2026-11-14T14:53:57.111+01:00",
+  "is_valid": true,
+  "validation_errors": [],
+  "symbol": "MATICBTC",
+  "last_price": 0.00000667,
+  "price_change_percent": 0.0,
+  "quote_volume": 0.00297615,
+  "trade_count": 1,
+  "raw_value": "{\"symbol\":\"MATICBTC\",\"priceChange\":\"0.00000000\", ...}"
+}
+
 ## Tests
 
 Run the unit tests with the server's Spark Python libraries on `PYTHONPATH`:
