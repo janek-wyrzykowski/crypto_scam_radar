@@ -4,11 +4,19 @@
 from __future__ import annotations
 
 import argparse
-from typing import Sequence
+from typing import Iterator, Sequence
 
+import pandas as pd
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import MapType, StringType
+from pyspark.sql.types import (
+    DoubleType,
+    LongType,
+    MapType,
+    StringType,
+    StructField,
+    StructType,
+)
 
 
 MARKET_TOPIC = "crypto-market"
@@ -19,6 +27,15 @@ DEFAULT_TOPICS = (MARKET_TOPIC, CERTIFICATE_TOPIC)
 # The two feeds have different fields, so parse each flat JSON object into a
 # string-valued map first. Numeric values are cast only for market fields below.
 RECORD_SCHEMA = MapType(StringType(), StringType(), valueContainsNull=True)
+DELTA_FIELDS = (
+    StructField("snapshot_interval_seconds", DoubleType(), True),
+    StructField("price_return_percent", DoubleType(), True),
+    StructField("net_trade_count_delta", LongType(), True),
+    StructField("net_trade_count_per_second", DoubleType(), True),
+    StructField("net_quote_volume_delta", DoubleType(), True),
+    StructField("net_quote_volume_per_second", DoubleType(), True),
+    StructField("snapshot_comparison_status", StringType(), False),
+)
 
 
 def normalize_records(kafka_records: DataFrame) -> DataFrame:
@@ -41,6 +58,9 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
     symbol = F.upper(F.trim(F.col("record").getItem("symbol")))
     last_price = F.col("record").getItem("lastPrice").cast("double")
     price_change = F.col("record").getItem("priceChangePercent").cast("double")
+    quote_volume = F.col("record").getItem("quoteVolume").cast("double")
+    trade_count = F.col("record").getItem("count").cast("long")
+    close_time = F.col("record").getItem("closeTime").cast("long")
     certificate_id = F.col("record").getItem("id")
     common_name = F.trim(F.col("record").getItem("common_name"))
     name_value = F.trim(F.col("record").getItem("name_value"))
@@ -55,12 +75,24 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
                 F.lit("missing_symbol"),
             ),
             F.when(
-                is_market & last_price.isNull(),
+                is_market & (last_price.isNull() | (last_price <= 0)),
                 F.lit("invalid_last_price"),
             ),
             F.when(
                 is_market & price_change.isNull(),
                 F.lit("invalid_price_change_percent"),
+            ),
+            F.when(
+                is_market & (quote_volume.isNull() | (quote_volume < 0)),
+                F.lit("invalid_quote_volume"),
+            ),
+            F.when(
+                is_market & (trade_count.isNull() | (trade_count < 0)),
+                F.lit("invalid_trade_count"),
+            ),
+            F.when(
+                is_market & (close_time.isNull() | (close_time <= 0)),
+                F.lit("invalid_close_time"),
             ),
             F.when(
                 ~is_market
@@ -95,10 +127,9 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
         F.when(is_market, symbol).alias("symbol"),
         F.when(is_market, last_price).alias("last_price"),
         F.when(is_market, price_change).alias("price_change_percent"),
-        F.when(is_market, F.col("record").getItem("quoteVolume").cast("double"))
-        .alias("quote_volume"),
-        F.when(is_market, F.col("record").getItem("count").cast("long"))
-        .alias("trade_count"),
+        F.when(is_market, quote_volume).alias("quote_volume"),
+        F.when(is_market, trade_count).alias("trade_count"),
+        F.when(is_market, close_time).alias("exchange_close_time_ms"),
         F.when(~is_market, certificate_id).alias("certificate_id"),
         F.when(~is_market, common_name).alias("common_name"),
         F.when(~is_market, name_value).alias("name_value"),
@@ -108,6 +139,132 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
         .alias("not_after"),
         "raw_value",
     )
+
+
+def add_market_snapshot_deltas(records: DataFrame) -> DataFrame:
+    """Compare each valid market snapshot with the last one for its symbol.
+
+    Spark stores the previous snapshot in checkpointed per-symbol state. The
+    volume and trade-count differences are net changes to Binance's rolling
+    24-hour totals, not exact counts or volume for the interval.
+    """
+    output_schema = StructType(list(records.schema.fields) + list(DELTA_FIELDS))
+
+    def compare_group(
+        _key: tuple, batches: Iterator[pd.DataFrame], state
+    ) -> Iterator[pd.DataFrame]:
+        previous = None
+        if state.exists:
+            close_time, last_price, trade_count, quote_volume = state.get
+            previous = {
+                "close_time": int(close_time),
+                "last_price": float(last_price),
+                "trade_count": int(trade_count),
+                "quote_volume": float(quote_volume),
+            }
+
+        # A symbol may have multiple snapshots in one micro-batch. Sort those
+        # records by exchange time before updating its state.
+        frames = list(batches)
+        if not frames:
+            return
+        rows = pd.concat(frames, ignore_index=True).sort_values(
+            "exchange_close_time_ms", kind="stable"
+        )
+        output_rows = []
+        for row in rows.to_dict(orient="records"):
+            current = {
+                "close_time": int(row["exchange_close_time_ms"]),
+                "last_price": float(row["last_price"]),
+                "trade_count": int(row["trade_count"]),
+                "quote_volume": float(row["quote_volume"]),
+            }
+            deltas = {
+                "snapshot_interval_seconds": None,
+                "price_return_percent": None,
+                "net_trade_count_delta": None,
+                "net_trade_count_per_second": None,
+                "net_quote_volume_delta": None,
+                "net_quote_volume_per_second": None,
+            }
+
+            if previous is None:
+                status = "baseline"
+                previous = current
+            elif current["close_time"] <= previous["close_time"]:
+                # Do not let a replayed or late snapshot move state backwards.
+                status = "duplicate_or_out_of_order"
+            else:
+                interval = (current["close_time"] - previous["close_time"]) / 1000.0
+                trade_delta = current["trade_count"] - previous["trade_count"]
+                volume_delta = current["quote_volume"] - previous["quote_volume"]
+                deltas = {
+                    "snapshot_interval_seconds": interval,
+                    "price_return_percent": (
+                        current["last_price"] / previous["last_price"] - 1.0
+                    )
+                    * 100.0,
+                    "net_trade_count_delta": trade_delta,
+                    "net_trade_count_per_second": trade_delta / interval,
+                    "net_quote_volume_delta": volume_delta,
+                    "net_quote_volume_per_second": volume_delta / interval,
+                }
+                status = "compared"
+                previous = current
+
+            output_rows.append(
+                {
+                    **row,
+                    **deltas,
+                    "snapshot_comparison_status": status,
+                }
+            )
+
+        if previous is not None:
+            state.update(
+                (
+                    previous["close_time"],
+                    previous["last_price"],
+                    previous["trade_count"],
+                    previous["quote_volume"],
+                )
+            )
+        yield pd.DataFrame(output_rows, columns=output_schema.fieldNames())
+
+    # Invalid market rows and certificate rows do not participate in the
+    # per-symbol state, but retain the same output schema for the Kafka sink.
+    market_valid = records.filter(
+        (F.col("source_topic") == MARKET_TOPIC) & F.col("is_valid")
+    )
+    stateful_market = market_valid.groupBy("symbol").applyInPandasWithState(
+        compare_group,
+        output_schema,
+        StructType(
+            [
+                StructField("close_time", LongType(), False),
+                StructField("last_price", DoubleType(), False),
+                StructField("trade_count", LongType(), False),
+                StructField("quote_volume", DoubleType(), False),
+            ]
+        ),
+        "Append",
+        "NoTimeout",
+    )
+
+    passthrough = records.filter(
+        (F.col("source_topic") != MARKET_TOPIC) | ~F.col("is_valid")
+    )
+    for field in DELTA_FIELDS[:-1]:
+        passthrough = passthrough.withColumn(
+            field.name, F.lit(None).cast(field.dataType)
+        )
+    passthrough = passthrough.withColumn(
+        "snapshot_comparison_status",
+        F.when(F.col("source_topic") == MARKET_TOPIC, F.lit("invalid")).otherwise(
+            F.lit("not_applicable")
+        ),
+    )
+    return stateful_market.unionByName(passthrough)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -130,7 +287,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--checkpoint-location",
-        default="file:///tmp/crypto-scam-radar-checkpoint",
+        default="file:///tmp/crypto-scam-radar-checkpoint-deltas",
         help="Durable Structured Streaming checkpoint path",
     )
     parser.add_argument(
@@ -183,7 +340,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         .option("kafka.allow.auto.create.topics", "false")
         .load()
     )
-    normalized = normalize_records(kafka_records)
+    normalized = add_market_snapshot_deltas(normalize_records(kafka_records))
 
     def write_batch(batch: DataFrame, batch_id: int) -> None:
         # Both show() and the Kafka write are actions. Persist this micro-batch
