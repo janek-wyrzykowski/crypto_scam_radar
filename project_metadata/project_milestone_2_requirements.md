@@ -1,9 +1,5 @@
 # Project Milestone 2
 
-## Wymagania zaliczenia (Completion Requirements)
-* **Otwarto:** piątek, 2 października 2026, 00:00
-* **Wymagane do:** poniedziałek, 23 listopada 2026, 23:59
-
 ### Overview & Attendance
 * The primary objective of this milestone is to develop data acquisition and pre-processing modules and to present the results during a scheduled project meeting.
 * All team members are required to attend the project presentation session (90-minute slot).
