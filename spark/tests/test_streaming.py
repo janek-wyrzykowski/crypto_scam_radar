@@ -17,7 +17,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from streaming import (
+from spark.streaming import (
     add_market_snapshot_deltas,
     normalize_records,
     parse_args,

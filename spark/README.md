@@ -1,110 +1,107 @@
 # Spark streaming module
 
-This PySpark Structured Streaming job currently focuses on Binance ticker
-snapshots from the `crypto-market` Kafka topic. It normalizes records, marks
-invalid messages, computes per-symbol snapshot metrics, prints each
-micro-batch, and publishes output to Kafka. Original JSON is retained in
-`raw_value` for downstream analysis. The certificate topic remains an optional
-input for later work, but is not consumed by default.
+This module reads cryptocurrency ticker messages from Kafka, checks and
+normalizes them with Spark, and publishes the results back to Kafka. It can
+also keep the latest accepted ticker for each symbol in HBase.
 
-For market records, it uppercases `symbol` and parses the last price, price
-change, quote volume, and trade count. For certificate records, it exposes the
-certificate ID, common name, names, and validity dates. `is_valid` and
-`validation_errors` describe whether required fields could be parsed; invalid
-messages are still forwarded with their original `raw_value`. This is a
-normalization and market-snapshot metrics pipeline, not yet a scam-detection
-classifier.
+The pipeline is a data-processing foundation, not a scam classifier: it
+calculates changes between ticker snapshots but does not yet label coins as
+safe or suspicious.
 
-For each market symbol, Spark keeps the previous valid snapshot in its
-checkpointed state. It calculates `price_return_percent` from the two
-`lastPrice` values and reports `net_trade_count_delta` and
-`net_quote_volume_delta`, including per-second rates and the actual interval
-between exchange timestamps. The first snapshot for each symbol is marked
-`baseline`; repeated or out-of-order snapshots are marked and do not move the
-saved state. Count and volume deltas are **net changes in Binance's rolling
-24-hour totals**, not exact trades or volume during that interval; they may be
-negative as older activity leaves the window. Certificate records currently
-pass through without being correlated to market anomalies or generating alerts.
+## The pipeline in plain language
 
-The output preserves Kafka's message key, broker timestamp, partition, offset,
-and value size, along with NiFi's poll ID, poll-received timestamp, and original
-HTTP response size from Kafka headers. Spark reports record count and total
-value bytes per micro-batch and per poll. `kafka_timestamp` is the record's
-Kafka timestamp, not the time the HTTP request started.
+| Component | What it does |
+| --- | --- |
+| **Binance** | Provides ticker snapshots. Each snapshot contains rolling 24-hour totals. |
+| **NiFi** | Requests a snapshot every 10 seconds, splits the response into one message per symbol, and sends the messages to Kafka. |
+| **Kafka** | Holds the messages so Spark can read them. The market topic is `crypto-market`. |
+| **Spark** | Parses each message, checks required fields, compares snapshots for each symbol, and writes normalized results to Kafka. |
+| **HBase (optional)** | Stores the latest accepted state per symbol instead of keeping every incoming message. |
 
-The inspected NiFi flow polls Binance every 10 seconds and splits its JSON
-array before publishing to `crypto-market`. It also has a certificate path to
-`cyber-certs`, which this Binance-focused job does not subscribe to by default.
-Kafka's automatic input-topic creation is disabled so a stale or misspelled
-topic is not created.
+In short:
 
-## NiFi ingestion metadata and failure visibility
-
-The verified Binance path is `InvokeHTTP` (10-second schedule) ->
-`UpdateAttribute` -> `SplitJson` -> `PublishKafka`. The attributes are set on
-the HTTP response before splitting: `poll_id=${uuid}`,
-`poll_received_at=${now():format(...)}`, and `response_bytes=${fileSize}`.
-`PublishKafka` uses `${poll_id}` as its Kafka key and forwards these attributes
-as headers matching `^(poll_id|poll_received_at|response_bytes)$`. Thus, all
-ticker records from one response have the same key and repeat the same poll
-headers.
-
-`response_bytes` describes the pre-split HTTP response and is repeated on each
-resulting ticker record; do not sum it across records in a poll.
-`message_bytes`, in contrast, is the size of one split Kafka value. The
-`poll_received_at` header is recorded after the response arrives, so it is not
-the HTTP request start time.
-
-The Binance publisher uses `acks=all`. The current `crypto-market` topic has
-replication factor 1 on a single broker, so this acknowledges the only replica
-and does not provide broker redundancy. InvokeHTTP `Failure`, `Retry`, and
-`No Retry` relationships route to logging; `Retry` is logged rather than
-re-attempted, so a failed poll waits for the next scheduled request. SplitJson
-and Kafka publish failures are also logged.
-
-Spark enables Kafka header inclusion and parses the three headers into the
-normalized output. Messages produced before the NiFi metadata was configured
-may not have these headers; Spark leaves the corresponding output fields null.
-
-## HBase state tables
-
-HBase is the intended database for compact serving state; the full raw ticker
-stream is not archived under the current database-only policy. The
-`crypto_scam_radar` namespace now contains:
-
-| Table | Row granularity | Column families |
-| --- | --- | --- |
-| `symbol_state` | One row per Binance symbol | `latest`, `baseline`, `meta` |
-| `anomaly_events` | One row per emitted candidate event | `signal`, `source` |
-
-Each family currently retains one version. `symbol_state` will hold the latest
-accepted snapshot and that symbol's baseline state. `anomaly_events` will hold
-only suspicious candidates and their supporting source/features. The tables
-have been created and verified. When enabled, Spark bulk-upserts only the
-latest accepted row per symbol into `symbol_state`; it does not persist every
-input record. HBase cell timestamps use Kafka record timestamps for replay-safe
-writes; the writer also compares exchange close times before upserting, so an
-older snapshot cannot replace a newer one. The baseline and anomaly-event
-writers are separate future behavior.
-
-Start HBase Thrift bound to localhost in a separate terminal:
-
-```bash
-HBASE_CONF_DIR=/opt/bigdata/hbase/conf \
-  /opt/bigdata/hbase/bin/hbase thrift start -b 127.0.0.1 -p 9090
+```text
+Binance -> NiFi -> Kafka (crypto-market) -> Spark
+                                           |-> Kafka (crypto-processed)
+                                           `-> HBase (optional)
 ```
 
-Enable the state writer by passing `--hbase-thrift-host 127.0.0.1
---hbase-thrift-port 9090` to `streaming.py`. The `happybase` client is installed
-with `spark/requirements.txt`; without the host option, the existing Kafka-only
-behavior is unchanged.
+The certificate feed is published separately to `cyber-certs`. Spark supports
+that topic, but the default run below subscribes only to `crypto-market`.
 
-## Run
+A **poll** is one scheduled request NiFi makes to Binance. It produces many
+messages—one per symbol—and those messages share a `poll_id`. This lets you
+group ticker records that came from the same Binance response.
 
-The installed server stack is Spark 3.5.9, Scala 2.12, Kafka 3.6.1, and Hadoop
-3.3.6. The Spark installation does not include the Kafka connector, so submit
-with the matching connector package (Spark resolves it from Maven). Ensure
-NiFi and Kafka are running and create the output topic first:
+## What Spark calculates
+
+For each market message, Spark preserves the original JSON and Kafka/NiFi
+metadata, parses fields such as symbol, price, quote volume, and trade count,
+and marks invalid messages with `is_valid` and `validation_errors`. Invalid
+messages are still included in the output for troubleshooting.
+
+Spark keeps the last accepted snapshot for each symbol in its checkpoint.
+The first snapshot is called the **baseline**. Later snapshots are compared
+with it to calculate price return and changes in trade count and quote volume.
+Because Binance reports rolling 24-hour totals, those count and volume changes
+are **net changes in the rolling totals**—not exact activity during the
+10-second polling interval. They can be negative when older activity leaves
+the 24-hour window.
+
+The Kafka output topic is `crypto-processed`. Each output message is a JSON
+object with the parsed fields, comparison results, source metadata, and the
+original message in `raw_value`. For example:
+
+```json
+{
+  "source_topic": "crypto-market",
+  "symbol": "BTCUSDT",
+  "last_price": 65000.25,
+  "snapshot_comparison_status": "compared",
+  "net_trade_count_delta": 12,
+  "is_valid": true,
+  "raw_value": "{\"symbol\":\"BTCUSDT\", ...}"
+}
+```
+
+## What is stored
+
+The current policy is to avoid archiving every raw ticker message:
+
+- Spark's **checkpoint** remembers stream progress and prior per-symbol
+  snapshots. Keep it between runs; a new or deleted checkpoint loses that
+  Spark state.
+- HBase's `crypto_scam_radar:symbol_state` table has one row per symbol. When
+  HBase writing is enabled, Spark upserts the latest accepted snapshot for
+  each symbol in a batch. Kafka timestamps and exchange close times prevent
+  duplicate or older snapshots from replacing newer state.
+- The `baseline` column family and `anomaly_events` table are reserved for
+  future baseline statistics and suspicious-event records. Spark does not
+  populate them yet.
+
+## Run locally
+
+The server setup used by this project is Spark 3.5.9, Scala 2.12, Kafka 3.6.1,
+and Hadoop 3.3.6. The Spark installation does not bundle the Kafka connector,
+so `spark-submit` downloads the matching connector package. NiFi and Kafka
+must be running before starting the stream.
+
+### 1. Prepare Python
+
+From the repository root, create an environment for the Python packages used
+by the Spark job and its Python workers:
+
+```bash
+python3 -m venv --system-site-packages "$HOME/.venvs/crypto-scam-radar"
+"$HOME/.venvs/crypto-scam-radar/bin/pip" install -r spark/requirements.txt
+export PYSPARK_PYTHON="$HOME/.venvs/crypto-scam-radar/bin/python"
+export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
+```
+
+### 2. Create the output topic
+
+Spark writes normalized messages to `crypto-processed`. Create that topic
+before starting the job:
 
 ```bash
 /opt/bigdata/kafka/bin/kafka-topics.sh \
@@ -114,17 +111,9 @@ NiFi and Kafka are running and create the output topic first:
   --partitions 1 --replication-factor 1
 ```
 
-The stateful Pandas API also requires pandas and PyArrow. Install them in a
-Python environment that can access the Spark installation:
+### 3. Start Spark
 
-```bash
-python3 -m venv --system-site-packages "$HOME/.venvs/crypto-scam-radar"
-"$HOME/.venvs/crypto-scam-radar/bin/pip" install -r spark/requirements.txt
-export PYSPARK_PYTHON="$HOME/.venvs/crypto-scam-radar/bin/python"
-export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
-```
-
-From the repository root, start the stream:
+Run this from the repository root:
 
 ```bash
 /opt/bigdata/spark/bin/spark-submit \
@@ -138,83 +127,81 @@ From the repository root, start the stream:
   --starting-offsets latest
 ```
 
-The Spark terminal prints each processed micro-batch. To also read the output
-topic, run this in another terminal:
+The job keeps running and prints a summary for each micro-batch. Press
+`Ctrl+C` to stop it. With `latest`, it starts with messages arriving after the
+job starts. To replay retained Kafka messages, use `earliest` and a **new
+checkpoint path**. When reusing a checkpoint, Spark resumes its saved offsets
+and ignores the starting-offset setting.
+
+### Optional: write latest state to HBase
+
+The HBase tables must exist, and the HBase Thrift service must be running.
+On the current server, start the service in another terminal:
+
+```bash
+HBASE_CONF_DIR=/opt/bigdata/hbase/conf \
+  /opt/bigdata/hbase/bin/hbase thrift start -b 127.0.0.1 -p 9090
+```
+
+Add these options to the Spark command to enable HBase writes:
+
+```text
+--hbase-thrift-host 127.0.0.1 --hbase-thrift-port 9090
+```
+
+Without these options, the stream writes only to Kafka.
+
+## Inspect the output
+
+In another terminal, read a few processed messages:
 
 ```bash
 /opt/bigdata/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 \
   --topic crypto-processed \
-  --from-beginning
+  --from-beginning \
+  --max-messages 3
 ```
 
-With `latest`, the job processes records arriving after startup. To replay
-retained input records, use `--starting-offsets earliest` with a **new**
-checkpoint path. Reusing the same checkpoint resumes the saved offsets, so
-changing `--starting-offsets` alone will not replay data. This version adds
-per-symbol state, so use the new `crypto-scam-radar-checkpoint-deltas` path
-instead of a checkpoint created by the earlier stateless version.
-
-For a YARN deployment, use a shared durable checkpoint path (for example an
-HDFS path) and a cluster-accessible Kafka address. Use a new checkpoint path
-when changing input topics or starting-offset behavior; an existing checkpoint
-takes precedence over `--starting-offsets`. Also make the pandas/PyArrow
-environment available to every executor and set `PYSPARK_PYTHON` to that
-environment. Kafka output is at-least-once, so downstream consumers should
-tolerate duplicates when a micro-batch is retried.
-
-## Output Format
-
-The job normalizes incoming streams into a unified data envelope. Validated records are published to `crypto-processed` in the following JSON format:
-
-```json
-{
-  "source_topic": "crypto-market",
-  "source_message_key": "poll-id-from-nifi-or-null",
-  "kafka_timestamp": "2026-11-20T11:40:00.123Z",
-  "kafka_partition": 0,
-  "kafka_offset": 41,
-  "message_bytes": 246,
-  "poll_id": "poll-id-from-nifi-or-null",
-  "poll_received_at": "2026-11-20T11:40:00.100+01:00",
-  "response_bytes": 1913232,
-  "event_type": "market_ticker",
-  "processed_at": "2026-11-20T11:40:01.111Z",
-  "is_valid": true,
-  "validation_errors": [],
-  "symbol": "MATICBTC",
-  "last_price": 0.00000667,
-  "price_change_percent": 0.0,
-  "quote_volume": 0.00297615,
-  "trade_count": 1,
-  "exchange_close_time_ms": 1795174800000,
-  "snapshot_interval_seconds": null,
-  "price_return_percent": null,
-  "net_trade_count_delta": null,
-  "net_trade_count_per_second": null,
-  "net_quote_volume_delta": null,
-  "net_quote_volume_per_second": null,
-  "snapshot_comparison_status": "baseline",
-  "raw_value": "{\"symbol\":\"MATICBTC\",\"lastPrice\":\"0.00000667\", ...}"
-}
-```
-
-`source_message_key` and `poll_id` should match for records from the current
-NiFi flow. `response_bytes` is copied from a header and repeated for every
-ticker in a poll; `message_bytes` measures only this split ticker value.
-
-## Tests
-
-Run the unit tests with the server's Spark Python libraries on `PYTHONPATH`:
+If HBase writing is enabled, inspect a few symbol rows with the HBase shell:
 
 ```bash
-cd spark
-PYTHONPATH=/opt/bigdata/spark/python:/opt/bigdata/spark/python/lib/py4j-0.10.9.7-src.zip \
-PYSPARK_PYTHON="$HOME/.venvs/crypto-scam-radar/bin/python" \
-PYSPARK_DRIVER_PYTHON="$HOME/.venvs/crypto-scam-radar/bin/python" \
-  "$HOME/.venvs/crypto-scam-radar/bin/python" -m unittest -v
+/opt/bigdata/hbase/bin/hbase shell
 ```
 
-The tests cover both input shapes, normalization, invalid-record reporting,
-per-symbol snapshot state across micro-batches, and late-snapshot handling.
-They do not require a live Kafka broker.
+Then run:
+
+```text
+scan 'crypto_scam_radar:symbol_state', {LIMIT => 5}
+```
+
+## Run the tests
+
+The unit tests use local Spark and do not need a live Kafka broker or HBase
+Thrift service. Run them from the repository root:
+
+```bash
+export SPARK_HOME=/opt/bigdata/spark
+export PYSPARK_PYTHON="$HOME/.venvs/crypto-scam-radar/bin/python"
+export PYSPARK_DRIVER_PYTHON="$PYSPARK_PYTHON"
+export PYTHONPATH="$SPARK_HOME/python/lib/pyspark.zip:$SPARK_HOME/python/lib/py4j-0.10.9.7-src.zip:$PWD"
+
+"$PYSPARK_PYTHON" -m unittest discover \
+  -s spark/tests -t . -p 'test_*.py' -v
+```
+
+Tests live under `spark/tests/`. They cover record normalization, snapshot
+comparisons, Kafka header handling, state-row selection, and HBase row
+encoding.
+
+## Important limitations
+
+- NiFi's Kafka publisher uses `acks=all`, but `crypto-market` currently has
+  replication factor 1 on a single broker. This does not provide broker
+  redundancy.
+- In the inspected NiFi flow, failed HTTP requests are logged; the `Retry`
+  relationship is not an actual retry.
+- Kafka output is at-least-once. A retried Spark micro-batch can produce
+  duplicate output messages, so downstream consumers should tolerate them.
+- For a cluster deployment, use a durable checkpoint location shared by the
+  Spark workers and a Kafka address reachable from those workers.

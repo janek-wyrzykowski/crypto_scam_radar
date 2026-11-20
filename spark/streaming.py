@@ -405,7 +405,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     spark = SparkSession.builder.appName("crypto-scam-radar").getOrCreate()
     hbase_state_writer = None
     if args.hbase_thrift_host:
-        from hbase_store import HBaseStateWriter
+        if __package__:
+            from .hbase_store import HBaseStateWriter
+        else:
+            from hbase_store import HBaseStateWriter
 
         hbase_state_writer = HBaseStateWriter(
             host=args.hbase_thrift_host,

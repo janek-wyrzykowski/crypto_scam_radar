@@ -1,6 +1,6 @@
 import unittest
 
-from hbase_store import encode_symbol_state
+from spark.hbase_store import encode_symbol_state
 
 
 class EncodeSymbolStateTest(unittest.TestCase):
