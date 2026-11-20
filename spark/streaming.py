@@ -7,7 +7,7 @@ import argparse
 from typing import Iterator, Sequence
 
 import pandas as pd
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DoubleType,
@@ -23,7 +23,10 @@ MARKET_TOPIC = "crypto-market"
 # NiFi publishes the crt.sh feed to cyber-certs. Keep this list aligned with
 # the actual NiFi flow so the consumer does not subscribe to stale topic names.
 CERTIFICATE_TOPIC = "cyber-certs"
-DEFAULT_TOPICS = (MARKET_TOPIC, CERTIFICATE_TOPIC)
+SUPPORTED_TOPICS = (MARKET_TOPIC, CERTIFICATE_TOPIC)
+# Keep the current anomaly-detection run focused on Binance. The certificate
+# feed remains supported for later use, but is not consumed by default.
+DEFAULT_TOPICS = (MARKET_TOPIC,)
 # The two feeds have different fields, so parse each flat JSON object into a
 # string-valued map first. Numeric values are cast only for market fields below.
 RECORD_SCHEMA = MapType(StringType(), StringType(), valueContainsNull=True)
@@ -47,8 +50,24 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
     """
     # Spark's Kafka source exposes the topic and message value. Convert the
     # binary value to text once, then parse the JSON object into a generic map.
+    # Keep Kafka transport metadata for measuring ingestion and diagnosing
+    # retries/gaps. The message key can carry a NiFi poll/request ID when set.
+    headers = F.map_from_entries(F.col("headers"))
     records = kafka_records.select(
         F.col("topic").alias("source_topic"),
+        F.col("key").cast("string").alias("source_message_key"),
+        F.col("timestamp").alias("kafka_timestamp"),
+        F.col("partition").alias("kafka_partition"),
+        F.col("offset").alias("kafka_offset"),
+        F.length("value").alias("message_bytes"),
+        F.element_at(headers, F.lit("poll_id")).cast("string").alias("poll_id"),
+        F.element_at(headers, F.lit("poll_received_at"))
+        .cast("string")
+        .alias("poll_received_at"),
+        F.element_at(headers, F.lit("response_bytes"))
+        .cast("string")
+        .cast("long")
+        .alias("response_bytes"),
         F.col("value").cast("string").alias("raw_value"),
     ).withColumn("record", F.from_json("raw_value", RECORD_SCHEMA))
 
@@ -118,6 +137,14 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
     # re-parsing raw_value. Fields belonging to the other feed are null.
     return records.select(
         "source_topic",
+        "source_message_key",
+        "kafka_timestamp",
+        "kafka_partition",
+        "kafka_offset",
+        "message_bytes",
+        "poll_id",
+        "poll_received_at",
+        "response_bytes",
         F.when(is_market, F.lit("market_ticker"))
         .otherwise(F.lit("certificate"))
         .alias("event_type"),
@@ -267,6 +294,34 @@ def add_market_snapshot_deltas(records: DataFrame) -> DataFrame:
     return stateful_market.unionByName(passthrough)
 
 
+def select_latest_market_state(batch: DataFrame) -> DataFrame:
+    """Select one newest accepted snapshot per symbol for the HBase state table."""
+    return (
+        batch.filter(
+            (F.col("source_topic") == MARKET_TOPIC)
+            & F.col("is_valid")
+            & F.col("snapshot_comparison_status").isin("baseline", "compared")
+        )
+        .withColumn(
+            "_state_rank",
+            F.row_number().over(
+                Window.partitionBy("symbol").orderBy(
+                    F.col("exchange_close_time_ms").desc(),
+                    F.col("kafka_timestamp").desc(),
+                    F.col("kafka_partition").desc(),
+                    F.col("kafka_offset").desc(),
+                )
+            ),
+        )
+        .filter(F.col("_state_rank") == 1)
+        .drop("_state_rank")
+        .withColumn(
+            "kafka_timestamp_ms",
+            F.unix_millis("kafka_timestamp"),
+        )
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse runtime settings and reject input/output topic feedback loops."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -307,6 +362,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=20,
         help="Maximum rows printed per micro-batch (default: %(default)s)",
     )
+    parser.add_argument(
+        "--hbase-thrift-host",
+        default=None,
+        help="Enable HBase state writes through this HBase Thrift host",
+    )
+    parser.add_argument(
+        "--hbase-thrift-port",
+        type=int,
+        default=9090,
+        help="HBase Thrift port (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--hbase-state-table",
+        default="crypto_scam_radar:symbol_state",
+        help="HBase table for per-symbol state (default: %(default)s)",
+    )
     args = parser.parse_args(argv)
     if args.console_rows < 0:
         parser.error("--console-rows must be zero or greater")
@@ -315,19 +386,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.topics = tuple(topic.strip() for topic in args.topics.split(",") if topic.strip())
     if not args.topics:
         parser.error("--topics must contain at least one topic")
-    unsupported_topics = sorted(set(args.topics) - set(DEFAULT_TOPICS))
+    unsupported_topics = sorted(set(args.topics) - set(SUPPORTED_TOPICS))
     if unsupported_topics:
         parser.error(
             "--topics contains unsupported topic(s): " + ", ".join(unsupported_topics)
         )
     if args.output_topic in args.topics:
         parser.error("--output-topic must not be one of the input topics")
+    if not 1 <= args.hbase_thrift_port <= 65535:
+        parser.error("--hbase-thrift-port must be between 1 and 65535")
+    if not args.hbase_state_table.strip():
+        parser.error("--hbase-state-table must not be empty")
     return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     spark = SparkSession.builder.appName("crypto-scam-radar").getOrCreate()
+    hbase_state_writer = None
+    if args.hbase_thrift_host:
+        from hbase_store import HBaseStateWriter
+
+        hbase_state_writer = HBaseStateWriter(
+            host=args.hbase_thrift_host,
+            port=args.hbase_thrift_port,
+            table_name=args.hbase_state_table,
+        )
     topic_list = ",".join(args.topics)
     # Structured Streaming resumes offsets from its checkpoint after the first
     # run. The explicit startingOffsets value is used only for a new checkpoint.
@@ -336,6 +420,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
         .option("subscribe", topic_list)
         .option("startingOffsets", args.starting_offsets)
+        .option("includeHeaders", "true")
         # Do not let a typo or stale NiFi topic name create a new broker topic.
         .option("kafka.allow.auto.create.topics", "false")
         .load()
@@ -347,9 +432,39 @@ def main(argv: Sequence[str] | None = None) -> None:
         # so Spark evaluates the source and normalization only once.
         batch.persist()
         try:
+            # Report what Spark actually received in this micro-batch. These
+            # bytes count Kafka values only, not Kafka protocol overhead or
+            # the full pre-SplitJson HTTP response.
+            totals = batch.agg(
+                F.count("*").alias("records"),
+                F.sum("message_bytes").alias("payload_bytes"),
+            ).first()
             # Console output is intended for development/inspection; zero rows
             # disables it without disabling publication to the output topic.
-            print(f"Micro-batch {batch_id}")
+            print(
+                f"Micro-batch {batch_id}: records={totals.records}, "
+                f"Kafka value bytes={totals.payload_bytes or 0}"
+            )
+            # A request ID used as the Kafka key lets us measure how many
+            # split ticker records and bytes came from each NiFi poll.
+            poll_totals = (
+                batch.filter(F.col("source_message_key").isNotNull())
+                .groupBy("source_message_key")
+                .agg(
+                    F.count("*").alias("records"),
+                    F.sum("message_bytes").alias("payload_bytes"),
+                )
+                .collect()
+            )
+            for poll in poll_totals:
+                print(
+                    f"  poll_id={poll.source_message_key}: "
+                    f"records={poll.records}, Kafka value bytes={poll.payload_bytes}"
+                )
+            if hbase_state_writer:
+                latest_state = select_latest_market_state(batch).toLocalIterator()
+                written = hbase_state_writer.write(latest_state)
+                print(f"  HBase symbol-state upserts={written}")
             if args.console_rows:
                 batch.show(args.console_rows, truncate=False)
             # Kafka expects a string value. Serialize the complete normalized
@@ -371,13 +486,17 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # foreachBatch lets the same micro-batch be displayed and written to Kafka
     # under one checkpointed streaming query.
-    (
+    query = (
         normalized.writeStream.foreachBatch(write_batch)
         .option("checkpointLocation", args.checkpoint_location)
         .trigger(processingTime=args.trigger_interval)
         .start()
-        .awaitTermination()
     )
+    try:
+        query.awaitTermination()
+    finally:
+        if hbase_state_writer:
+            hbase_state_writer.close()
 
 
 if __name__ == "__main__":

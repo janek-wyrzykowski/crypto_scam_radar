@@ -1,11 +1,28 @@
+from datetime import datetime
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    ArrayType,
+    BooleanType,
+    BinaryType,
+    IntegerType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 
-from streaming import add_market_snapshot_deltas, normalize_records, parse_args
+from streaming import (
+    add_market_snapshot_deltas,
+    normalize_records,
+    parse_args,
+    select_latest_market_state,
+)
 
 
 class NormalizeRecordsTest(unittest.TestCase):
@@ -25,10 +42,46 @@ class NormalizeRecordsTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.spark.stop()
 
-    def normalize(self, topic, value):
+    def normalize(self, topic, value, headers=None):
         # Match the columns emitted by Spark's Kafka source that the
         # normalization function consumes.
-        source = self.spark.createDataFrame([(topic, value)], ["topic", "value"])
+        schema = StructType(
+            [
+                StructField("topic", StringType(), False),
+                StructField("key", BinaryType(), True),
+                StructField("value", BinaryType(), False),
+                StructField("timestamp", TimestampType(), False),
+                StructField("partition", IntegerType(), False),
+                StructField("offset", LongType(), False),
+                StructField(
+                    "headers",
+                    ArrayType(
+                        StructType(
+                            [
+                                StructField("key", StringType(), False),
+                                StructField("value", BinaryType(), True),
+                            ]
+                        ),
+                        True,
+                    ),
+                    True,
+                ),
+            ]
+        )
+        source = self.spark.createDataFrame(
+            [
+                (
+                    topic,
+                    b"poll-123",
+                    value.encode("utf-8"),
+                    datetime(2026, 11, 20, 12, 0, 0),
+                    2,
+                    41,
+                    headers,
+                )
+            ],
+            schema,
+        )
         return normalize_records(source).first()
 
     def test_normalizes_market_ticker(self):
@@ -48,6 +101,39 @@ class NormalizeRecordsTest(unittest.TestCase):
         self.assertEqual(result.price_change_percent, 2.5)
         self.assertEqual(result.trade_count, 42)
         self.assertEqual(result.exchange_close_time_ms, 1700000000000)
+        self.assertEqual(result.source_message_key, "poll-123")
+        self.assertEqual(result.kafka_partition, 2)
+        self.assertEqual(result.kafka_offset, 41)
+        self.assertEqual(
+            result.kafka_timestamp, datetime(2026, 11, 20, 12, 0, 0)
+        )
+        self.assertEqual(result.message_bytes, len(result.raw_value.encode("utf-8")))
+        self.assertIsNone(result.poll_id)
+        self.assertIsNone(result.poll_received_at)
+        self.assertIsNone(result.response_bytes)
+
+    def test_normalizes_nifi_poll_headers(self):
+        result = self.normalize(
+            "crypto-market",
+            '{"symbol":"BTCUSDT","lastPrice":"65000",'
+            '"priceChangePercent":"2.5","quoteVolume":"1000",'
+            '"count":"42","closeTime":"1700000000000"}',
+            [
+                {"key": "poll_id", "value": b"poll-123"},
+                {
+                    "key": "poll_received_at",
+                    "value": b"2026-11-20T13:13:18.393+01:00",
+                },
+                {"key": "response_bytes", "value": b"1913232"},
+            ],
+        )
+
+        self.assertEqual(result.source_message_key, "poll-123")
+        self.assertEqual(result.poll_id, "poll-123")
+        self.assertEqual(
+            result.poll_received_at, "2026-11-20T13:13:18.393+01:00"
+        )
+        self.assertEqual(result.response_bytes, 1913232)
 
     def test_normalizes_certificate_from_nifi_topic(self):
         # The installed NiFi flow publishes crt.sh records to cyber-certs.
@@ -98,7 +184,11 @@ class NormalizeRecordsTest(unittest.TestCase):
         # micro-batches, exercising checkpointed per-symbol state transitions.
         with tempfile.TemporaryDirectory() as input_dir:
             source = (
-                self.spark.readStream.schema("topic STRING, value STRING")
+                self.spark.readStream.schema(
+                    "topic STRING, key STRING, value STRING, timestamp TIMESTAMP, "
+                    "partition INT, offset BIGINT, "
+                    "headers ARRAY<STRUCT<key: STRING, value: BINARY>>"
+                )
                 .json(input_dir)
             )
             output = add_market_snapshot_deltas(normalize_records(source))
@@ -179,6 +269,9 @@ class NormalizeRecordsTest(unittest.TestCase):
     def test_rejects_unsupported_topics_and_input_output_loops(self):
         # Only the two NiFi source topics are valid, and publishing back into
         # an input topic would cause the stream to consume its own output.
+        default_args = parse_args([])
+        self.assertEqual(default_args.topics, ("crypto-market",))
+
         args = parse_args(["--topics", "crypto-market,cyber-certs"])
         self.assertEqual(args.topics, ("crypto-market", "cyber-certs"))
 
@@ -186,6 +279,92 @@ class NormalizeRecordsTest(unittest.TestCase):
             parse_args(["--topics", "crypto-cert"])
         with self.assertRaises(SystemExit):
             parse_args(["--topics", "crypto-market", "--output-topic", "crypto-market"])
+
+    def test_accepts_hbase_state_writer_options(self):
+        args = parse_args(
+            [
+                "--hbase-thrift-host",
+                "127.0.0.1",
+                "--hbase-thrift-port",
+                "9090",
+                "--hbase-state-table",
+                "crypto_scam_radar:symbol_state",
+            ]
+        )
+
+        self.assertEqual(args.hbase_thrift_host, "127.0.0.1")
+        self.assertEqual(args.hbase_thrift_port, 9090)
+        self.assertEqual(args.hbase_state_table, "crypto_scam_radar:symbol_state")
+
+    def test_selects_latest_accepted_symbol_state(self):
+        schema = StructType(
+            [
+                StructField("source_topic", StringType(), False),
+                StructField("is_valid", BooleanType(), False),
+                StructField("snapshot_comparison_status", StringType(), False),
+                StructField("symbol", StringType(), True),
+                StructField("exchange_close_time_ms", LongType(), True),
+                StructField("kafka_timestamp", TimestampType(), True),
+                StructField("kafka_partition", IntegerType(), True),
+                StructField("kafka_offset", LongType(), True),
+            ]
+        )
+        rows = [
+            (
+                "crypto-market",
+                True,
+                "baseline",
+                "BTCUSDT",
+                1700000000000,
+                datetime(2026, 11, 20, 12, 0, 0),
+                0,
+                1,
+            ),
+            (
+                "crypto-market",
+                True,
+                "compared",
+                "BTCUSDT",
+                1700000010000,
+                datetime(2026, 11, 20, 12, 0, 10),
+                0,
+                2,
+            ),
+            (
+                "crypto-market",
+                True,
+                "duplicate_or_out_of_order",
+                "BTCUSDT",
+                1699999990000,
+                datetime(2026, 11, 20, 12, 0, 20),
+                0,
+                3,
+            ),
+            (
+                "cyber-certs",
+                True,
+                "not_applicable",
+                None,
+                None,
+                datetime(2026, 11, 20, 12, 0, 30),
+                0,
+                4,
+            ),
+        ]
+        source = self.spark.createDataFrame(rows, schema)
+
+        selected = select_latest_market_state(source).select(
+            "symbol", "exchange_close_time_ms", "kafka_timestamp_ms"
+        ).collect()
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].symbol, "BTCUSDT")
+        self.assertEqual(selected[0].exchange_close_time_ms, 1700000010000)
+        self.assertIsNotNone(selected[0].kafka_timestamp_ms)
+
+    def test_rejects_invalid_hbase_port(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--hbase-thrift-port", "70000"])
 
 
 if __name__ == "__main__":
