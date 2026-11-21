@@ -1,0 +1,10 @@
+[project]
+name = "crypto-scam-radar"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "certstream>=1.12",
+    "dotenv>=0.9.9",
+]
