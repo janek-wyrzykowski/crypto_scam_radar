@@ -2,6 +2,7 @@ import socket
 import json
 import certstream
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,10 +19,11 @@ def send_to_nifi(sock, message):
 
 def callback(message, context):
     global nifi_socket
-    if message.get("message_type") == "certificate_update":
+    if message.get("message_type") == "dns_entries":
         try:
             send_to_nifi(nifi_socket, message)
         except:
+            print(f"[-] Error sending to NiFi ({e}), reconnecting...")
             nifi_socket = reconnect_nifi()
 
 def reconnect_nifi():
@@ -33,10 +35,10 @@ def reconnect_nifi():
             print("[+] Connected to NiFi!")
             return s
         except Exception:
-            import time
+            print(f"[-] NiFi connection failed, ({e}), retrying in 5s...")
             time.sleep(5)
 
 if __name__ == "__main__":
     nifi_socket = reconnect_nifi()
     print("[*] Listening to local CertStream Rust server...")
-    certstream.listen_for_events(callback, url='ws://localhost:8080/')
+    certstream.listen_for_events(callback, url='ws://localhost:8080/domains-only')
