@@ -17,6 +17,9 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from spark.certificates_streaming import (
+    normalize_certificate_records,
+)
 from spark.streaming import (
     add_market_snapshot_deltas,
     normalize_records,
@@ -34,6 +37,7 @@ class NormalizeRecordsTest(unittest.TestCase):
             SparkSession.builder.master("local[1]")
             .appName("crypto-scam-radar-tests")
             .config("spark.ui.enabled", "false")
+            .config("spark.sql.shuffle.partitions", "4")
             .getOrCreate()
         )
         cls.spark.sparkContext.setLogLevel("ERROR")
@@ -45,6 +49,11 @@ class NormalizeRecordsTest(unittest.TestCase):
     def normalize(self, topic, value, headers=None):
         # Match the columns emitted by Spark's Kafka source that the
         # normalization function consumes.
+        return normalize_records(
+            self.kafka_source(topic, value, headers=headers)
+        ).first()
+
+    def kafka_source(self, topic, value, headers=None):
         schema = StructType(
             [
                 StructField("topic", StringType(), False),
@@ -82,7 +91,7 @@ class NormalizeRecordsTest(unittest.TestCase):
             ],
             schema,
         )
-        return normalize_records(source).first()
+        return source
 
     def test_normalizes_market_ticker(self):
         # Binance sends numeric values as JSON numbers or strings; the output
@@ -135,27 +144,52 @@ class NormalizeRecordsTest(unittest.TestCase):
         )
         self.assertEqual(result.response_bytes, 1913232)
 
-    def test_normalizes_certificate_from_nifi_topic(self):
-        # The installed NiFi flow publishes crt.sh records to cyber-certs.
+    def test_normalizes_certstream_domain_from_nifi_topic(self):
+        # NiFi publishes one plain CertStream domain name per Kafka message.
         result = self.normalize(
             "cyber-certs",
-            '{"id":123,"common_name":"example.crypto",'
-            '"name_value":"example.crypto","not_before":"2026-01-01"}',
+            " Example.Crypto. ",
         )
 
         self.assertTrue(result.is_valid)
-        self.assertEqual(result.event_type, "certificate")
-        self.assertEqual(result.certificate_id, "123")
-        self.assertEqual(result.common_name, "example.crypto")
+        self.assertEqual(result.event_type, "certificate_domain")
+        self.assertEqual(result.domain, "example.crypto")
 
-    def test_marks_invalid_records_without_dropping_them(self):
-        # Preserve the input even when JSON parsing fails so the downstream
-        # output topic can act as a simple dead-letter/diagnostic stream.
-        result = self.normalize("cyber-certs", "{not-json")
+    def test_marks_invalid_certificate_domain_without_dropping_it(self):
+        result = self.normalize("cyber-certs", "   ")
+
+        self.assertFalse(result.is_valid)
+        self.assertIn("missing_domain", result.validation_errors)
+        self.assertEqual(result.raw_value, "   ")
+
+    def test_marks_overlong_certificate_domain_invalid(self):
+        result = self.normalize("cyber-certs", "a" * 254)
+
+        self.assertFalse(result.is_valid)
+        self.assertIn("domain_too_long", result.validation_errors)
+
+    def test_marks_invalid_market_json_without_dropping_it(self):
+        result = self.normalize("crypto-market", "{not-json")
 
         self.assertFalse(result.is_valid)
         self.assertIn("invalid_json", result.validation_errors)
         self.assertEqual(result.raw_value, "{not-json")
+
+    def test_certificate_stream_selects_and_normalizes_domain_records(self):
+        source = self.kafka_source(
+            "cyber-certs",
+            "Example.Crypto.",
+            [
+                {"key": "poll_id", "value": b"poll-123"},
+                {"key": "response_bytes", "value": b"100"},
+            ],
+        )
+
+        result = normalize_certificate_records(source).first()
+
+        self.assertEqual(result.domain, "example.crypto")
+        self.assertEqual(result.poll_id, "poll-123")
+        self.assertEqual(result.event_type, "certificate_domain")
 
     def test_reports_missing_and_unparseable_market_fields(self):
         # A record is invalid if required ticker identifiers are absent or
@@ -218,16 +252,11 @@ class NormalizeRecordsTest(unittest.TestCase):
 
             try:
                 write_snapshot("snapshot-1.json", 1700000000000, 100, 100, 10000)
-                certificate = {
-                    "id": 123,
-                    "common_name": "example.crypto",
-                    "name_value": "example.crypto",
-                }
                 Path(input_dir, "certificate.json").write_text(
                     json.dumps(
                         {
                             "topic": "cyber-certs",
-                            "value": json.dumps(certificate),
+                            "value": "Example.Crypto.",
                         }
                     )
                     + "\n"
@@ -242,7 +271,8 @@ class NormalizeRecordsTest(unittest.TestCase):
                     "ORDER BY exchange_close_time_ms"
                 ).collect()
                 certificate_rows = self.spark.sql(
-                    f"SELECT * FROM {query_name} WHERE event_type = 'certificate'"
+                    f"SELECT * FROM {query_name} "
+                    "WHERE event_type = 'certificate_domain'"
                 ).collect()
             finally:
                 query.stop()
@@ -262,6 +292,7 @@ class NormalizeRecordsTest(unittest.TestCase):
         self.assertEqual(rows[3].net_trade_count_delta, -2)
         self.assertEqual(rows[3].net_quote_volume_delta, -200.0)
         self.assertEqual(len(certificate_rows), 1)
+        self.assertEqual(certificate_rows[0].domain, "example.crypto")
         self.assertEqual(
             certificate_rows[0].snapshot_comparison_status, "not_applicable"
         )
