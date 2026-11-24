@@ -92,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     kafka_records = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
+        .option("kafka.group.id", "cyber-certs-spark")
         .option("subscribe", CERTIFICATE_TOPIC)
         .option("startingOffsets", args.starting_offsets)
         .option("includeHeaders", "true")

@@ -145,7 +145,9 @@ The job keeps running and prints a summary for each micro-batch. Press
 `Ctrl+C` to stop it. With `latest`, it starts with messages arriving after the
 job starts. To replay retained Kafka messages, use `earliest` and a **new
 checkpoint path**. When reusing a checkpoint, Spark resumes its saved offsets
-and ignores the starting-offset setting.
+and ignores the starting-offset setting. The market Spark consumer uses Kafka
+group `crypto-market-spark`; use a different group for the NiFi HDFS archive
+so both consumers receive their own copy of the topic's records.
 
 ### Optional: write latest state to HBase
 
@@ -177,6 +179,11 @@ the output topic:
   --topic cyber-certs-processed \
   --partitions 2 --replication-factor 1
 ```
+
+The certificate Spark consumer uses Kafka consumer group
+`cyber-certs-spark`. Any other consumer of `cyber-certs` (such as the NiFi
+HDFS archival flow) must use a different group; consumers in the same group
+share the topic's partitions.
 
 Then start the job from the repository root:
 

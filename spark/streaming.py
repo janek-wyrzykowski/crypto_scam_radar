@@ -414,6 +414,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     kafka_records = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
+        .option("kafka.group.id", "crypto-market-spark")
         .option("subscribe", topic_list)
         .option("startingOffsets", args.starting_offsets)
         .option("includeHeaders", "true")
