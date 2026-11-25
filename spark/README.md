@@ -13,12 +13,13 @@ safe or suspicious.
 | Component | What it does |
 | --- | --- |
 | **Binance** | Provides ticker snapshots. Each snapshot contains rolling 24-hour totals. |
-| **NiFi** | Requests a snapshot every 10 seconds, splits the response into one message per symbol, and sends the messages to Kafka. |
-| **Kafka** | Holds the messages so Spark can read them. The market topic is `crypto-market`. |
+| **CertStream** | Streams newly observed domain names from Certificate Transparency activity. The current feed provides domain names, not full certificate records. |
+| **NiFi** | Polls Binance every 10 seconds and splits each response into one message per symbol. Its certificate flow receives CertStream events and publishes domain names. |
+| **Kafka** | Holds messages so Spark can read them: `crypto-market` for tickers and `cyber-certs` for certificate domains. |
 | **Spark** | Parses each message, checks required fields, compares snapshots for each symbol, and writes normalized results to Kafka. |
 | **HBase (optional)** | Stores the latest accepted state per symbol instead of keeping every incoming message. |
 
-In short:
+Market-data path:
 
 ```text
 Binance -> NiFi -> Kafka (crypto-market) -> Spark
@@ -26,8 +27,14 @@ Binance -> NiFi -> Kafka (crypto-market) -> Spark
                                            `-> HBase (optional)
 ```
 
-The certificate feed is published separately to `cyber-certs`. Spark supports
-that topic, but the default run below subscribes only to `crypto-market`.
+Certificate-domain path:
+
+```text
+CertStream server -> python/forwarder.py -> NiFi -> Kafka (cyber-certs)
+                                                   -> Spark -> Kafka (cyber-certs-processed)
+```
+
+The market and certificate feeds have separate Spark entry points below.
 
 A **poll** is one scheduled request NiFi makes to Binance. It produces many
 messages—one per symbol—and those messages share a `poll_id`. This lets you
@@ -63,6 +70,13 @@ original message in `raw_value`. For example:
   "raw_value": "{\"symbol\":\"BTCUSDT\", ...}"
 }
 ```
+
+The certificate topic contains one plain domain name per message, for example
+`www.example.com`. The certificate Spark job trims and lowercases it, removes a
+final DNS dot, and performs basic checks (non-empty, at most 253 characters,
+and no whitespace). It retains the original domain and Kafka/NiFi metadata.
+This job does not receive certificate bodies, issuer details, or validity
+dates, so it cannot produce those fields.
 
 ## What is stored
 
@@ -131,7 +145,9 @@ The job keeps running and prints a summary for each micro-batch. Press
 `Ctrl+C` to stop it. With `latest`, it starts with messages arriving after the
 job starts. To replay retained Kafka messages, use `earliest` and a **new
 checkpoint path**. When reusing a checkpoint, Spark resumes its saved offsets
-and ignores the starting-offset setting.
+and ignores the starting-offset setting. The market Spark consumer uses Kafka
+group `crypto-market-spark`; use a different group for the NiFi HDFS archive
+so both consumers receive their own copy of the topic's records.
 
 ### Optional: write latest state to HBase
 
@@ -151,6 +167,44 @@ Add these options to the Spark command to enable HBase writes:
 
 Without these options, the stream writes only to Kafka.
 
+## Process certificate domains
+
+The certificate feed has its own Spark script and output topic. First create
+the output topic:
+
+```bash
+/opt/bigdata/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create --if-not-exists \
+  --topic cyber-certs-processed \
+  --partitions 2 --replication-factor 1
+```
+
+The certificate Spark consumer uses Kafka consumer group
+`cyber-certs-spark`. Any other consumer of `cyber-certs` (such as the NiFi
+HDFS archival flow) must use a different group; consumers in the same group
+share the topic's partitions.
+
+Then start the job from the repository root:
+
+```bash
+/opt/bigdata/spark/bin/spark-submit \
+  --master 'local[2]' \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9 \
+  spark/certificates_streaming.py \
+  --bootstrap-servers 127.0.0.1:9092 \
+  --output-topic cyber-certs-processed \
+  --checkpoint-location file:///tmp/crypto-scam-radar-certificates-checkpoint \
+  --starting-offsets latest
+```
+
+As with the market job, keep the checkpoint between restarts. To replay
+retained certificate messages, use `earliest` with a **new checkpoint path**.
+The output contains the source message key, Kafka timestamp/partition/offset,
+NiFi poll metadata, normalized `domain`, validation status, and original
+`raw_value`. Spark sends invalid values to the output with validation errors;
+it does not discard them.
+
 ## Inspect the output
 
 In another terminal, read a few processed messages:
@@ -162,6 +216,9 @@ In another terminal, read a few processed messages:
   --from-beginning \
   --max-messages 3
 ```
+
+For certificate-domain output, replace `crypto-processed` with
+`cyber-certs-processed`.
 
 If HBase writing is enabled, inspect a few symbol rows with the HBase shell:
 
@@ -191,8 +248,8 @@ export PYTHONPATH="$SPARK_HOME/python/lib/pyspark.zip:$SPARK_HOME/python/lib/py4
 ```
 
 Tests live under `spark/tests/`. They cover record normalization, snapshot
-comparisons, Kafka header handling, state-row selection, and HBase row
-encoding.
+comparisons, certificate-domain normalization, Kafka header handling,
+state-row selection, and HBase row encoding.
 
 ## Important limitations
 

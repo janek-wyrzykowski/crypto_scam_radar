@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalize NiFi's Binance and crt.sh Kafka records and forward them to Kafka."""
+"""Normalize NiFi's Binance and CertStream Kafka records and forward them."""
 
 from __future__ import annotations
 
@@ -20,12 +20,12 @@ from pyspark.sql.types import (
 
 
 MARKET_TOPIC = "crypto-market"
-# NiFi publishes the crt.sh feed to cyber-certs. Keep this list aligned with
-# the actual NiFi flow so the consumer does not subscribe to stale topic names.
+# NiFi publishes CertStream domain names to cyber-certs. Keep this list aligned
+# with the actual NiFi flow so the consumer does not subscribe to stale topics.
 CERTIFICATE_TOPIC = "cyber-certs"
 SUPPORTED_TOPICS = (MARKET_TOPIC, CERTIFICATE_TOPIC)
-# Keep the current anomaly-detection run focused on Binance. The certificate
-# feed remains supported for later use, but is not consumed by default.
+# Keep the current anomaly-detection run focused on Binance. Certificate
+# domains can be processed independently with certificates_streaming.py.
 DEFAULT_TOPICS = (MARKET_TOPIC,)
 # The two feeds have different fields, so parse each flat JSON object into a
 # string-valued map first. Numeric values are cast only for market fields below.
@@ -42,11 +42,10 @@ DELTA_FIELDS = (
 
 
 def normalize_records(kafka_records: DataFrame) -> DataFrame:
-    """Return one validated output schema for Binance and crt.sh Kafka records.
+    """Return one validated output schema for Binance and CertStream records.
 
-    NiFi's SplitJson processors publish one JSON object per Kafka message. Keep
-    the original message alongside parsed fields so malformed or not-yet-known
-    properties are still available for diagnosis and downstream processing.
+    NiFi publishes one ticker JSON object or one certificate domain per Kafka
+    message. Keep the original value alongside parsed fields for diagnosis.
     """
     # Spark's Kafka source exposes the topic and message value. Convert the
     # binary value to text once, then parse the JSON object into a generic map.
@@ -71,8 +70,8 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
         F.col("value").cast("string").alias("raw_value"),
     ).withColumn("record", F.from_json("raw_value", RECORD_SCHEMA))
 
-    # The topic is the discriminator between the market and certificate
-    # schemas; all configured inputs besides crypto-market are cyber-certs.
+    # The topic distinguishes Binance's JSON objects from CertStream's plain
+    # domain-name values.
     is_market = F.col("source_topic") == MARKET_TOPIC
     symbol = F.upper(F.trim(F.col("record").getItem("symbol")))
     last_price = F.col("record").getItem("lastPrice").cast("double")
@@ -80,15 +79,18 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
     quote_volume = F.col("record").getItem("quoteVolume").cast("double")
     trade_count = F.col("record").getItem("count").cast("long")
     close_time = F.col("record").getItem("closeTime").cast("long")
-    certificate_id = F.col("record").getItem("id")
-    common_name = F.trim(F.col("record").getItem("common_name"))
-    name_value = F.trim(F.col("record").getItem("name_value"))
+    certificate_domain = F.regexp_replace(
+        F.lower(F.trim(F.col("raw_value"))), r"\.$", ""
+    )
 
     # Build an array of only the applicable errors. A malformed record is
     # retained with is_valid=false rather than dropped from the stream.
     validation_errors = F.filter(
         F.array(
-            F.when(F.col("record").isNull(), F.lit("invalid_json")),
+            F.when(
+                is_market & F.col("record").isNull(),
+                F.lit("invalid_json"),
+            ),
             F.when(
                 is_market & (symbol.isNull() | (symbol == "")),
                 F.lit("missing_symbol"),
@@ -115,19 +117,16 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
             ),
             F.when(
                 ~is_market
-                & (
-                    certificate_id.isNull()
-                    | (F.trim(certificate_id) == "")
-                ),
-                F.lit("missing_certificate_id"),
+                & (certificate_domain.isNull() | (certificate_domain == "")),
+                F.lit("missing_domain"),
             ),
             F.when(
-                ~is_market & (common_name.isNull() | (common_name == "")),
-                F.lit("missing_common_name"),
+                ~is_market & (F.length(certificate_domain) > 253),
+                F.lit("domain_too_long"),
             ),
             F.when(
-                ~is_market & (name_value.isNull() | (name_value == "")),
-                F.lit("missing_name_value"),
+                ~is_market & certificate_domain.rlike(r"\s"),
+                F.lit("domain_contains_whitespace"),
             ),
         ),
         lambda error: error.isNotNull(),
@@ -146,7 +145,7 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
         "poll_received_at",
         "response_bytes",
         F.when(is_market, F.lit("market_ticker"))
-        .otherwise(F.lit("certificate"))
+        .otherwise(F.lit("certificate_domain"))
         .alias("event_type"),
         F.current_timestamp().alias("processed_at"),
         (F.size(validation_errors) == 0).alias("is_valid"),
@@ -157,13 +156,7 @@ def normalize_records(kafka_records: DataFrame) -> DataFrame:
         F.when(is_market, quote_volume).alias("quote_volume"),
         F.when(is_market, trade_count).alias("trade_count"),
         F.when(is_market, close_time).alias("exchange_close_time_ms"),
-        F.when(~is_market, certificate_id).alias("certificate_id"),
-        F.when(~is_market, common_name).alias("common_name"),
-        F.when(~is_market, name_value).alias("name_value"),
-        F.when(~is_market, F.col("record").getItem("not_before"))
-        .alias("not_before"),
-        F.when(~is_market, F.col("record").getItem("not_after"))
-        .alias("not_after"),
+        F.when(~is_market, certificate_domain).alias("domain"),
         "raw_value",
     )
 
@@ -421,6 +414,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     kafka_records = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
+        .option("kafka.group.id", "crypto-market-spark")
         .option("subscribe", topic_list)
         .option("startingOffsets", args.starting_offsets)
         .option("includeHeaders", "true")
